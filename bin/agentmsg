@@ -616,15 +616,6 @@ cmd_launch() {
     tmux send-keys -t "$pane0" "$claude_cmd" Enter
     tmux send-keys -t "$pane1" "$codex_cmd" Enter
 
-    # Wait for agents to initialize, then inject Codex's first prompt
-    echo "agentmsg: waiting for agents to start..."
-    sleep 3
-
-    local codex_prompt='Follow the instructions in codex-instructions.md exactly. Start your review loop by running: agentmsg wait --timeout 3600 --type review_request'
-    tmux send-keys -t "$pane1" -l -- "$codex_prompt"
-    sleep 0.1
-    tmux send-keys -t "$pane1" Enter
-
     log_entry "LAUNCH session=$session project=$project"
 
     # Focus Claude's pane
@@ -643,8 +634,10 @@ cmd_launch() {
     echo "  │                  │  (live monitor)  │"
     echo "  └──────────────────┴──────────────────┘"
     echo ""
-    echo "  Give Claude a task. It will commit and wait for review."
-    echo "  Codex has been prompted to start its review loop."
+    echo "  Both agents started in interactive mode."
+    echo "  When ready, tell Codex to enter review mode:"
+    echo "    agentmsg pane-exec codex 'Follow codex-instructions.md and start reviewing'"
+    echo "  Or just type it into Codex's pane yourself."
     echo ""
 
     tmux attach -t "$session"
