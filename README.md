@@ -1,171 +1,111 @@
 # agentmsg
 
-A filesystem-based messaging system that lets Claude Code and Codex (or any two
-CLI agents) exchange structured messages with blocking wait semantics.
+A filesystem-based messaging system that lets two AI coding agents running in
+interactive TUI mode (Claude Code + Codex) communicate with each other via
+structured messages. Watch them review each other's code in real-time across
+tmux panes.
 
-## Quick Start
-
-```bash
-# Install
-./install.sh                  # installs to /usr/local/bin
-# or: ./install.sh ~/.local/bin  # install without sudo
-
-# Dependencies
-sudo apt-get install jq                  # required
-sudo apt-get install inotify-tools       # optional, faster detection
-
-# Initialize in your project
-cd ~/my-project
-agentmsg init .    # creates /tmp/agentmsg/ + installs git hooks
-```
-
-## Tmux Session Setup
-
-```bash
-# Create a 3-pane tmux session
-tmux new-session -d -s agents -c ~/my-project
-
-# Pane 0: Claude Code (left)
-# Pane 1: Codex (top-right)
-tmux split-window -h -t agents -c ~/my-project
-# Pane 2: Monitor (bottom-right)
-tmux split-window -v -t agents:0.1 -c ~/my-project
-
-# Set identities in each pane
-tmux send-keys -t agents:0.0 'export AGENTMSG_IDENTITY=claude' Enter
-tmux send-keys -t agents:0.1 'export AGENTMSG_IDENTITY=codex'  Enter
-tmux send-keys -t agents:0.2 'watch -n2 agentmsg status'       Enter
-
-tmux attach -t agents
-```
+## How It Works
 
 ```
 ┌────────────────────────┬────────────────────────┐
 │                        │                        │
-│   Pane 0: Claude       │   Pane 1: Codex        │
+│   Claude Code (TUI)    │   Codex (TUI)          │
 │                        │                        │
-│ export AGENTMSG_       │ export AGENTMSG_       │
-│   IDENTITY=claude      │   IDENTITY=codex       │
+│   1. Implements code   │   4. Receives request  │
+│   2. Commits           │   5. Reviews the diff  │
+│   3. Waits for review  │   6. Sends review back │
+│                        │                        │
+│   7. Reads review      │   8. Waits for next    │
+│   8. Fixes if needed   │      review request    │
+│   9. Commits again...  │                        │
 │                        ├────────────────────────┤
-│                        │   Pane 2: Monitor      │
-│                        │ watch agentmsg status  │
+│                        │   agentmsg status      │
+│                        │   (live monitor)       │
 └────────────────────────┴────────────────────────┘
 ```
 
-## Usage Patterns
+Both agents run in their normal interactive TUI mode. They communicate by
+calling `agentmsg` shell commands from within their sessions. A git
+post-commit hook automatically notifies the reviewer after each commit.
+You observe everything live in the TUI.
 
-### Pattern A: Automatic (Git Hook Driven)
-
-Claude commits code. The post-commit hook auto-sends a `review_request` to
-Codex. Codex is blocking on `agentmsg wait`.
-
-**Pane 0 — Claude's workflow:**
+## Quick Start
 
 ```bash
+# 1. Install agentmsg
+cd ~/agentmsg
+./install.sh
+
+# 2. Set up your project
+./setup-project.sh ~/my-project
+
+# 3. Launch the dual-agent tmux session
+./launch-agents.sh ~/my-project
+```
+
+That's it. In Claude's pane, give it a task. It will implement, commit, and
+wait for review. In Codex's pane, tell it to follow `codex-instructions.md`
+and start the review loop.
+
+## Manual Setup
+
+If you prefer to set things up yourself instead of using the launcher:
+
+**Terminal 1 — Claude Code:**
+```bash
+cd ~/my-project
 export AGENTMSG_IDENTITY=claude
-
-# Claude writes code (however you invoke it)
-claude "Implement JWT auth in src/auth.py"
-
-# Claude committed, hook fires automatically.
-# Now wait for Codex's review before proceeding:
-REVIEW=$(agentmsg wait --timeout 600 --type review_response)
-echo "$REVIEW" | jq -r '.body'
-
-# Feed the review back to Claude if fixes are needed:
-ISSUES=$(echo "$REVIEW" | jq -r '.body')
-if echo "$ISSUES" | grep -qi "fix\|bug\|issue\|error"; then
-    claude "Fix these review issues: $ISSUES"
-fi
+claude
 ```
+Claude Code automatically reads `CLAUDE.md` from the project root, which
+contains the review protocol instructions.
 
-**Pane 1 — Codex's workflow:**
-
+**Terminal 2 — Codex:**
 ```bash
+cd ~/my-project
 export AGENTMSG_IDENTITY=codex
-
-while true; do
-    # Block until a review request arrives
-    MSG=$(agentmsg wait --timeout 3600 --type review_request)
-    [ $? -ne 0 ] && continue
-
-    SHA=$(echo "$MSG" | jq -r '.metadata.commit_sha')
-    BODY=$(echo "$MSG" | jq -r '.body')
-    MSG_ID=$(echo "$MSG" | jq -r '.id')
-
-    # Get the diff
-    DIFF=$(git diff "${SHA}~1".."${SHA}" 2>/dev/null || git show "$SHA")
-
-    # Run Codex review
-    REVIEW=$(codex "Review this code change. Be specific about issues.
-
-${BODY}
-
-Diff:
-${DIFF}" 2>&1)
-
-    # Send review back to Claude
-    agentmsg send claude "$REVIEW" \
-        --type review_response \
-        --subject "Review of ${SHA}" \
-        --reply-to "$MSG_ID"
-done
+codex
 ```
+Give Codex this opening prompt:
+> Follow the instructions in codex-instructions.md. Start by running
+> `agentmsg wait --timeout 3600 --type review_request` and review
+> whatever comes in.
 
-### Pattern B: Explicit Messaging
-
-Agents send messages directly without relying on git hooks.
-
+**Terminal 3 — Monitor (optional):**
 ```bash
-# Claude sends a specific request
-agentmsg send codex "I refactored the DB layer in src/db/. \
-Check the connection pooling logic for race conditions." \
-    --type review_request
-
-# Claude blocks waiting for reply
-REPLY=$(agentmsg wait --timeout 600)
-echo "$REPLY" | jq -r '.body'
+watch -n2 agentmsg status
 ```
 
-```bash
-# Codex receives and responds
-MSG=$(agentmsg wait --timeout 600)
-# ... do the review ...
-agentmsg send claude "Found 2 issues: ..." --type review_response \
-    --reply-to "$(echo "$MSG" | jq -r '.id')"
-```
+## What You'll See
 
-### Pattern C: Full Automated Loop
+In **Claude's TUI**, you'll see it:
+1. Write code and commit
+2. Run `agentmsg wait --timeout 600 --type review_response`
+3. Receive the review JSON and display the feedback
+4. Fix issues if needed and commit again
 
-```bash
-#!/bin/bash
-export AGENTMSG_IDENTITY=orchestrator
-TASKS=(
-    "Implement user registration with email validation"
-    "Add rate limiting middleware"
-    "Write unit tests for auth module"
-)
+In **Codex's TUI**, you'll see it:
+1. Run `agentmsg wait --timeout 3600 --type review_request`
+2. Receive the commit notification
+3. Run `git diff` to examine changes
+4. Write a review and send it with `agentmsg send claude "..." --type review_response`
+5. Go back to waiting
 
-for task in "${TASKS[@]}"; do
-    echo "=== Task: $task ==="
+In the **Monitor pane**, you'll see message counts update in real-time.
 
-    # Tell Claude to implement
-    tmux send-keys -t agents:0.0 "claude \"$task\"" Enter
+## Project Files
 
-    # Wait for Codex's review (it auto-triggers via hook)
-    export AGENTMSG_IDENTITY=claude
-    REVIEW=$(agentmsg wait --timeout 900 --type review_response)
-    STATUS=$?
+`setup-project.sh` creates these files in your project:
 
-    if [ $STATUS -eq 0 ]; then
-        echo "Review received:"
-        echo "$REVIEW" | jq -r '.body' | head -20
-    else
-        echo "Review timed out, moving on"
-    fi
-    echo ""
-done
-```
+| File | Purpose |
+|------|---------|
+| `CLAUDE.md` | Instructions Claude Code reads automatically — tells it to use the review protocol |
+| `codex-instructions.md` | Instructions you give Codex — tells it to run the review-wait loop |
+
+Both files are templates you can customize. The key instructions are:
+- Claude: commit, then run `agentmsg wait`, then act on review
+- Codex: run `agentmsg wait`, review the diff, send response, repeat
 
 ## Command Reference
 
@@ -212,8 +152,8 @@ Each message is a JSON file written atomically (write `.tmp`, then `mv`):
   "from": "claude",
   "to": "codex",
   "type": "review_request",
-  "subject": "feat: implement user auth module",
-  "body": "Committed auth module in src/auth.py. Please review.",
+  "subject": "a1b2c3d feat: implement user auth module",
+  "body": "Committed: a1b2c3d feat: implement user auth module\n...",
   "metadata": {
     "commit_sha": "a1b2c3d",
     "files_changed": ["src/auth.py", "src/models.py"],
@@ -224,18 +164,36 @@ Each message is a JSON file written atomically (write `.tmp`, then `mv`):
 }
 ```
 
+## Repo Structure
+
+```
+agentmsg/
+├── bin/
+│   └── agentmsg              # CLI tool (bash, ~500 lines)
+├── hooks/
+│   ├── post-commit            # Auto-sends review_request on commit
+│   └── pre-push               # Blocks push if unread reviews pending
+├── templates/
+│   ├── CLAUDE.md              # Project instructions for Claude Code
+│   └── codex-instructions.md  # Project instructions for Codex
+├── install.sh                 # Install agentmsg to PATH
+├── setup-project.sh           # Bootstrap a project for dual-agent workflow
+├── launch-agents.sh           # Launch tmux session with both agents
+└── README.md
+```
+
 ## Runtime File Layout
 
 ```
 /tmp/agentmsg/
 ├── inbox/
-│   ├── claude/          # messages waiting for Claude
-│   └── codex/           # messages waiting for Codex
-├── archive/             # read/acknowledged messages
+│   ├── claude/     # messages waiting for Claude
+│   └── codex/      # messages waiting for Codex
+├── archive/        # read/acknowledged messages
 │   ├── claude/
 │   └── codex/
-├── lock/                # lockfiles for atomic sends
-└── agentmsg.log         # append-only event log
+├── lock/           # lockfiles for atomic sends
+└── agentmsg.log    # append-only event log
 ```
 
 ## Debugging
@@ -248,12 +206,16 @@ find /tmp/agentmsg -name '*.json' -exec jq -r \
 # Tail the log
 tail -f /tmp/agentmsg/agentmsg.log
 
-# Manually inspect a message
-cat /tmp/agentmsg/inbox/codex/*.json | jq .
-
 # Reset everything
 rm -rf /tmp/agentmsg && agentmsg init .
 ```
+
+## Dependencies
+
+- `bash` (4.0+)
+- `jq`
+- `inotify-tools` (optional, for faster message detection)
+- `tmux` (for the launcher)
 
 ## License
 
