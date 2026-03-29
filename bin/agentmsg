@@ -254,7 +254,7 @@ cmd_wait() {
 
     local now
     now=$(date -u +%s)
-    for f in "$my_inbox"/*.json 2>/dev/null; do
+    for f in "$my_inbox"/*.json; do
         [ -f "$f" ] || continue
         local msg_ts
         msg_ts=$(jq -r '.timestamp' "$f" 2>/dev/null) || continue
