@@ -2,7 +2,7 @@
 
 This project uses `agentmsg` for inter-agent communication. You are the
 **reviewer** (identity: `codex`). A peer agent (Claude Code) is running in a
-separate terminal as the **implementer**.
+separate tmux pane as the **implementer**.
 
 ## Your workflow
 
@@ -54,7 +54,22 @@ file names, line numbers, and what needs to change.
   ```
 - If the wait times out, restart the wait. Keep listening.
 
+## Pane commands (cross-pane interaction)
+
+You can observe and interact with the implementer's tmux pane directly:
+
+```bash
+agentmsg pane-list                     # see all panes with labels
+agentmsg pane-read claude 30           # read last 30 lines from Claude's pane
+agentmsg pane-exec claude "<command>"  # run a command in Claude's pane
+```
+
+Use `pane-read` to check if the implementer is stuck or idle. Prefer structured
+messages (`agentmsg send/wait`) for all protocol communication — only use
+pane commands for debugging or observing status.
+
 ## Environment
 
 The environment variable `AGENTMSG_IDENTITY` is set to `codex` in your shell.
-The `agentmsg` CLI is on PATH. `jq` is available.
+The `agentmsg` CLI is on PATH. `jq` is available. You are inside a tmux pane
+labeled `codex`.

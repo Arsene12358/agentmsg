@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AGENTMSG_VERSION="1.0.0"
+AGENTMSG_VERSION="2.0.0"
 AGENTMSG_DIR="${AGENTMSG_DIR:-/tmp/agentmsg}"
 AGENTMSG_IDENTITY="${AGENTMSG_IDENTITY:-}"
 AGENTMSG_POLL_INTERVAL="${AGENTMSG_POLL_INTERVAL:-2}"
@@ -449,16 +449,217 @@ cmd_install_hook() {
     install_hook "$repo_dir"
 }
 
+# ─── pane: tmux pane I/O (vendored from smux/tmux-bridge concepts) ────────────
+
+require_tmux() {
+    command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+}
+
+# Resolve a target: pane ID (%N), tmux address (session:win.pane), or label
+resolve_pane() {
+    local target="$1"
+
+    # Already a pane ID like %0, %12
+    [[ "$target" =~ ^%[0-9]+$ ]] && { echo "$target"; return; }
+
+    # tmux native address with : or .
+    [[ "$target" == *:* || "$target" == *.* ]] && { echo "$target"; return; }
+
+    # Pure numeric — window index
+    [[ "$target" =~ ^[0-9]+$ ]] && { echo "$target"; return; }
+
+    # Resolve as a @name label
+    local result
+    result=$(tmux list-panes -a -F '#{pane_id} #{@name}' 2>/dev/null \
+        | awk -v lbl="$target" '$2 == lbl { print $1; exit }')
+    [ -n "$result" ] || die "no pane found with label '$target'"
+    echo "$result"
+}
+
+validate_pane() {
+    tmux display-message -t "$1" -p '#{pane_id}' >/dev/null 2>&1 \
+        || die "invalid pane target: $1"
+}
+
+cmd_pane_list() {
+    require_tmux
+    printf "%-8s %-16s %-10s %-20s %-10s %s\n" "TARGET" "SESSION:WIN" "SIZE" "PROCESS" "LABEL" "CWD"
+    tmux list-panes -a \
+        -F '#{pane_id}|#{session_name}|#{window_index}|#{pane_pid}|#{pane_width}x#{pane_height}|#{@name}|#{pane_current_path}' \
+        2>/dev/null | while IFS='|' read -r id sess widx pid size label cwd; do
+        local proc child_pid
+        proc=$(ps -o comm= -p "$pid" 2>/dev/null || echo "?")
+        child_pid=$(pgrep -P "$pid" 2>/dev/null | head -1 || true)
+        if [ -n "$child_pid" ]; then
+            local child_proc
+            child_proc=$(ps -o comm= -p "$child_pid" 2>/dev/null || true)
+            [ -n "$child_proc" ] && proc="$child_proc"
+        fi
+        cwd="${cwd/#$HOME/~}"
+        printf "%-8s %-16s %-10s %-20s %-10s %s\n" \
+            "$id" "${sess}:${widx}" "$size" "$proc" "${label:--}" "$cwd"
+    done
+}
+
+cmd_pane_read() {
+    require_tmux
+    [ $# -lt 1 ] && die "usage: agentmsg pane-read <target> [lines]"
+    local target
+    target=$(resolve_pane "$1")
+    validate_pane "$target"
+    local lines="${2:-50}"
+    tmux capture-pane -t "$target" -p -J -S "-${lines}"
+}
+
+cmd_pane_type() {
+    require_tmux
+    [ $# -lt 2 ] && die "usage: agentmsg pane-type <target> <text>"
+    local target
+    target=$(resolve_pane "$1")
+    validate_pane "$target"
+    tmux send-keys -t "$target" -l -- "$2"
+}
+
+cmd_pane_keys() {
+    require_tmux
+    [ $# -lt 2 ] && die "usage: agentmsg pane-keys <target> <key> [key...]"
+    local target
+    target=$(resolve_pane "$1")
+    validate_pane "$target"
+    shift
+    for key in "$@"; do
+        tmux send-keys -t "$target" "$key"
+    done
+}
+
+cmd_pane_name() {
+    require_tmux
+    [ $# -lt 2 ] && die "usage: agentmsg pane-name <target> <label>"
+    local target
+    target=$(resolve_pane "$1")
+    validate_pane "$target"
+    tmux set-option -p -t "$target" @name "$2"
+}
+
+cmd_pane_exec() {
+    require_tmux
+    [ $# -lt 2 ] && die "usage: agentmsg pane-exec <target> <command>"
+    local target
+    target=$(resolve_pane "$1")
+    validate_pane "$target"
+    tmux send-keys -t "$target" -l -- "$2"
+    sleep 0.1
+    tmux send-keys -t "$target" Enter
+}
+
+# ─── launch ────────────────────────────────────────────────────────────────────
+
+cmd_launch() {
+    require_tmux
+
+    local project="${1:-.}"
+    local session="agents"
+    local claude_cmd="${AGENTMSG_CLAUDE_CMD:-claude}"
+    local codex_cmd="${AGENTMSG_CODEX_CMD:-codex}"
+
+    [ -d "$project" ] || die "project directory not found: $project"
+    project="$(cd "$project" && pwd)"
+
+    # Initialize messaging if not already done
+    if [ ! -d "$AGENTMSG_DIR/inbox" ]; then
+        cmd_init "$project"
+    fi
+
+    # Copy templates if project has a .git dir and no CLAUDE.md
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local templates_dir="${script_dir}/../templates"
+
+    if [ -d "$project/.git" ] && [ -d "$templates_dir" ]; then
+        if [ ! -f "$project/CLAUDE.md" ] && [ -f "$templates_dir/CLAUDE.md" ]; then
+            cp "$templates_dir/CLAUDE.md" "$project/CLAUDE.md"
+            echo "agentmsg: created $project/CLAUDE.md"
+        fi
+        if [ ! -f "$project/codex-instructions.md" ] && [ -f "$templates_dir/codex-instructions.md" ]; then
+            cp "$templates_dir/codex-instructions.md" "$project/codex-instructions.md"
+            echo "agentmsg: created $project/codex-instructions.md"
+        fi
+    fi
+
+    # Kill existing session
+    tmux kill-session -t "$session" 2>/dev/null || true
+
+    # Create 3-pane layout
+    tmux new-session -d -s "$session" -c "$project" -x 220 -y 50
+    tmux split-window -h -t "$session" -c "$project"
+    tmux split-window -v -t "$session:0.1" -c "$project" -l 8
+
+    # Label panes
+    local pane0 pane1 pane2
+    pane0=$(tmux list-panes -t "$session:0" -F '#{pane_id}' | sed -n '1p')
+    pane1=$(tmux list-panes -t "$session:0" -F '#{pane_id}' | sed -n '2p')
+    pane2=$(tmux list-panes -t "$session:0" -F '#{pane_id}' | sed -n '3p')
+
+    tmux set-option -p -t "$pane0" @name claude
+    tmux set-option -p -t "$pane1" @name codex
+    tmux set-option -p -t "$pane2" @name monitor
+
+    # Set env vars in each pane
+    tmux send-keys -t "$pane0" "export AGENTMSG_IDENTITY=claude" Enter
+    tmux send-keys -t "$pane1" "export AGENTMSG_IDENTITY=codex" Enter
+
+    # Start monitor
+    tmux send-keys -t "$pane2" "watch -n2 agentmsg status" Enter
+
+    # Start agents
+    sleep 0.5
+    tmux send-keys -t "$pane0" "$claude_cmd" Enter
+    tmux send-keys -t "$pane1" "$codex_cmd" Enter
+
+    # Wait for agents to initialize, then inject Codex's first prompt
+    echo "agentmsg: waiting for agents to start..."
+    sleep 3
+
+    local codex_prompt='Follow the instructions in codex-instructions.md exactly. Start your review loop by running: agentmsg wait --timeout 3600 --type review_request'
+    tmux send-keys -t "$pane1" -l -- "$codex_prompt"
+    sleep 0.1
+    tmux send-keys -t "$pane1" Enter
+
+    log_entry "LAUNCH session=$session project=$project"
+
+    # Focus Claude's pane
+    tmux select-pane -t "$pane0"
+
+    echo ""
+    echo "agentmsg: launched session '$session'"
+    echo ""
+    echo "  ┌──────────────────┬──────────────────┐"
+    echo "  │                  │                  │"
+    echo "  │  Claude Code     │  Codex           │"
+    echo "  │  (implementer)   │  (reviewer)      │"
+    echo "  │                  │                  │"
+    echo "  │                  ├──────────────────┤"
+    echo "  │                  │  agentmsg status │"
+    echo "  │                  │  (live monitor)  │"
+    echo "  └──────────────────┴──────────────────┘"
+    echo ""
+    echo "  Give Claude a task. It will commit and wait for review."
+    echo "  Codex has been prompted to start its review loop."
+    echo ""
+
+    tmux attach -t "$session"
+}
+
 # ─── help ──────────────────────────────────────────────────────────────────────
 
 cmd_help() {
     cat <<'HELP'
-agentmsg — inter-agent messaging system
+agentmsg — inter-agent messaging & pane control
 
 USAGE:
     agentmsg <command> [args...]
 
-COMMANDS:
+MESSAGING:
     init [repo-path]              Initialize messaging directory + install git hooks
     send <to> <body> [options]    Send a message to another agent
     wait [--timeout N] [--type T] Block until a message arrives (prints JSON to stdout)
@@ -466,8 +667,22 @@ COMMANDS:
     read <message-id>             Read and acknowledge a specific message
     history [N]                   Show last N log entries and archived messages
     status                        Show system status and message counts
-    install-hook <repo-path>      Install git post-commit hook into a repo
+    install-hook <repo-path>      Install git hooks into a repo
+
+PANE CONTROL (tmux):
+    pane-list                     List all tmux panes with labels and processes
+    pane-read <target> [lines]    Capture last N lines from a pane (default: 50)
+    pane-type <target> <text>     Type text into a pane (no Enter)
+    pane-keys <target> <key>...   Send keys: Enter, Escape, C-c, etc.
+    pane-name <target> <label>    Label a pane for easy addressing
+    pane-exec <target> <command>  Type command + press Enter
+
+SESSION:
+    launch [project-path]         Create tmux session with Claude + Codex + monitor
+
+OTHER:
     help                          Show this help
+    version                       Print version
 
 SEND OPTIONS:
     --type <type>           Message type: review_request, review_response,
@@ -478,21 +693,30 @@ SEND OPTIONS:
     --meta-files <json>     Changed files as JSON array
     --meta-stat <text>      Diff stat text
 
+PANE TARGETS:
+    Pane targets can be: a label (e.g. "codex"), a tmux pane ID (%0),
+    a tmux address (session:window.pane), or a window index.
+
 ENVIRONMENT:
-    AGENTMSG_IDENTITY       Required. Your agent name (e.g., "claude" or "codex")
+    AGENTMSG_IDENTITY       Required for messaging. Agent name (e.g., "claude")
     AGENTMSG_DIR            Message directory (default: /tmp/agentmsg)
     AGENTMSG_POLL_INTERVAL  Seconds between polls in wait (default: 2)
     AGENTMSG_STALE_SECONDS  Archive messages older than this (default: 3600)
+    AGENTMSG_CLAUDE_CMD     Command to launch Claude (default: claude)
+    AGENTMSG_CODEX_CMD      Command to launch Codex (default: codex)
 
 EXAMPLES:
-    export AGENTMSG_IDENTITY=claude
-    agentmsg init ~/my-project
-    agentmsg send codex "Auth module done, please review" --type review_request
-    agentmsg wait --timeout 600
+    # Launch dual-agent session
+    agentmsg launch ~/my-project
 
-    export AGENTMSG_IDENTITY=codex
-    agentmsg wait --timeout 600 --type review_request
-    agentmsg send claude "LGTM, ship it" --type review_response
+    # Messaging
+    agentmsg send codex "Auth module done, please review" --type review_request
+    agentmsg wait --timeout 600 --type review_response
+
+    # Pane control
+    agentmsg pane-list
+    agentmsg pane-read codex 30
+    agentmsg pane-exec codex "agentmsg wait --timeout 600"
 HELP
 }
 
@@ -511,6 +735,13 @@ main() {
         history)       cmd_history "$@" ;;
         status)        cmd_status "$@" ;;
         install-hook)  cmd_install_hook "$@" ;;
+        pane-list)     cmd_pane_list "$@" ;;
+        pane-read)     cmd_pane_read "$@" ;;
+        pane-type)     cmd_pane_type "$@" ;;
+        pane-keys)     cmd_pane_keys "$@" ;;
+        pane-name)     cmd_pane_name "$@" ;;
+        pane-exec)     cmd_pane_exec "$@" ;;
+        launch)        cmd_launch "$@" ;;
         help|--help|-h) cmd_help ;;
         version|--version|-v) echo "agentmsg v${AGENTMSG_VERSION}" ;;
         *)             die "unknown command: $cmd (try 'agentmsg help')" ;;

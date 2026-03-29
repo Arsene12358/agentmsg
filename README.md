@@ -1,9 +1,8 @@
 # agentmsg
 
-A filesystem-based messaging system that lets two AI coding agents running in
-interactive TUI mode (Claude Code + Codex) communicate with each other via
-structured messages. Watch them review each other's code in real-time across
-tmux panes.
+Inter-agent messaging + tmux pane control in a single CLI. Lets two AI coding
+agents running in interactive TUI mode (Claude Code + Codex) communicate via
+structured messages and observe each other's panes in real-time.
 
 ## How It Works
 
@@ -27,30 +26,37 @@ tmux panes.
 
 Both agents run in their normal interactive TUI mode. They communicate by
 calling `agentmsg` shell commands from within their sessions. A git
-post-commit hook automatically notifies the reviewer after each commit.
-You observe everything live in the TUI.
+post-commit hook automatically notifies the reviewer after each commit. The
+`launch` command sets up everything and injects the first prompt into Codex
+so the review loop starts immediately.
 
 ## Quick Start
 
 ```bash
-# 1. Install agentmsg
+# 1. Install
 cd ~/agentmsg
 ./install.sh
 
-# 2. Set up your project
-./setup-project.sh ~/my-project
-
-# 3. Launch the dual-agent tmux session
-./launch-agents.sh ~/my-project
+# 2. Launch (does everything: init, hooks, templates, tmux, agent bootstrap)
+agentmsg launch ~/my-project
 ```
 
-That's it. In Claude's pane, give it a task. It will implement, commit, and
-wait for review. In Codex's pane, tell it to follow `codex-instructions.md`
-and start the review loop.
+That's it. Give Claude a task in its pane. Watch the review cycle happen live.
+
+## What `launch` Does
+
+1. Creates `/tmp/agentmsg/` directory structure
+2. Installs git hooks in the project (`post-commit`, `pre-push`)
+3. Copies `CLAUDE.md` and `codex-instructions.md` into the project
+4. Creates a 3-pane tmux session (Claude, Codex, monitor)
+5. Labels the panes so agents can address each other by name
+6. Sets `AGENTMSG_IDENTITY` env var in each pane
+7. Starts both agents in TUI mode
+8. **Injects the first prompt into Codex's pane** so it begins the review loop
 
 ## Manual Setup
 
-If you prefer to set things up yourself instead of using the launcher:
+If you prefer not to use `launch`:
 
 **Terminal 1 — Claude Code:**
 ```bash
@@ -58,8 +64,7 @@ cd ~/my-project
 export AGENTMSG_IDENTITY=claude
 claude
 ```
-Claude Code automatically reads `CLAUDE.md` from the project root, which
-contains the review protocol instructions.
+Claude Code reads `CLAUDE.md` automatically.
 
 **Terminal 2 — Codex:**
 ```bash
@@ -67,59 +72,53 @@ cd ~/my-project
 export AGENTMSG_IDENTITY=codex
 codex
 ```
-Give Codex this opening prompt:
-> Follow the instructions in codex-instructions.md. Start by running
-> `agentmsg wait --timeout 3600 --type review_request` and review
-> whatever comes in.
+Give Codex: "Follow codex-instructions.md. Start by running
+`agentmsg wait --timeout 3600 --type review_request`"
 
 **Terminal 3 — Monitor (optional):**
 ```bash
 watch -n2 agentmsg status
 ```
 
-## What You'll See
-
-In **Claude's TUI**, you'll see it:
-1. Write code and commit
-2. Run `agentmsg wait --timeout 600 --type review_response`
-3. Receive the review JSON and display the feedback
-4. Fix issues if needed and commit again
-
-In **Codex's TUI**, you'll see it:
-1. Run `agentmsg wait --timeout 3600 --type review_request`
-2. Receive the commit notification
-3. Run `git diff` to examine changes
-4. Write a review and send it with `agentmsg send claude "..." --type review_response`
-5. Go back to waiting
-
-In the **Monitor pane**, you'll see message counts update in real-time.
-
-## Project Files
-
-`setup-project.sh` creates these files in your project:
-
-| File | Purpose |
-|------|---------|
-| `CLAUDE.md` | Instructions Claude Code reads automatically — tells it to use the review protocol |
-| `codex-instructions.md` | Instructions you give Codex — tells it to run the review-wait loop |
-
-Both files are templates you can customize. The key instructions are:
-- Claude: commit, then run `agentmsg wait`, then act on review
-- Codex: run `agentmsg wait`, review the diff, send response, repeat
-
 ## Command Reference
+
+### Messaging
 
 | Command | Description |
 |---------|-------------|
 | `agentmsg init [path]` | Create message dirs + install git hooks |
 | `agentmsg send <to> <body> [opts]` | Send a message (atomic write) |
-| `agentmsg wait [--timeout N]` | Block until message arrives (exit 0) or timeout (exit 1) |
-| `agentmsg wait --type T` | Wait for specific message type only |
-| `agentmsg list` | Show pending messages in your inbox |
-| `agentmsg read <id>` | Read + acknowledge a specific message |
-| `agentmsg history [N]` | Show last N log entries |
-| `agentmsg status` | Show pending/archived counts for all agents |
-| `agentmsg install-hook <path>` | Install hooks into an existing repo |
+| `agentmsg wait [--timeout N] [--type T]` | Block until message arrives |
+| `agentmsg list` | Show pending messages |
+| `agentmsg read <id>` | Read + acknowledge a message |
+| `agentmsg history [N]` | Show log entries |
+| `agentmsg status` | Show message counts |
+| `agentmsg install-hook <path>` | Install hooks into a repo |
+
+### Pane Control
+
+| Command | Description |
+|---------|-------------|
+| `agentmsg pane-list` | List all tmux panes with labels, processes, sizes |
+| `agentmsg pane-read <target> [lines]` | Capture last N lines from a pane (default: 50) |
+| `agentmsg pane-type <target> <text>` | Type text into a pane (no Enter) |
+| `agentmsg pane-keys <target> <key>...` | Send keys: Enter, Escape, C-c, etc. |
+| `agentmsg pane-name <target> <label>` | Label a pane for easy addressing |
+| `agentmsg pane-exec <target> <cmd>` | Type command + press Enter |
+
+### Session
+
+| Command | Description |
+|---------|-------------|
+| `agentmsg launch [project-path]` | Create tmux session with both agents + monitor |
+
+### Pane Targets
+
+Targets can be:
+- A **label**: `codex`, `claude` (set via `pane-name`)
+- A **tmux pane ID**: `%0`, `%3`
+- A **tmux address**: `agents:0.1`
+- A **window index**: `0`, `1`
 
 ### Send Options
 
@@ -137,13 +136,13 @@ Both files are templates you can customize. The key instructions are:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AGENTMSG_IDENTITY` | *(required)* | Agent name: `claude`, `codex`, etc. |
-| `AGENTMSG_DIR` | `/tmp/agentmsg` | Root directory for all message files |
+| `AGENTMSG_DIR` | `/tmp/agentmsg` | Root directory for message files |
 | `AGENTMSG_POLL_INTERVAL` | `2` | Seconds between polls in `wait` |
 | `AGENTMSG_STALE_SECONDS` | `3600` | Auto-archive messages older than this |
+| `AGENTMSG_CLAUDE_CMD` | `claude` | Command to start Claude Code |
+| `AGENTMSG_CODEX_CMD` | `codex` | Command to start Codex |
 
 ## Message Format
-
-Each message is a JSON file written atomically (write `.tmp`, then `mv`):
 
 ```json
 {
@@ -153,7 +152,7 @@ Each message is a JSON file written atomically (write `.tmp`, then `mv`):
   "to": "codex",
   "type": "review_request",
   "subject": "a1b2c3d feat: implement user auth module",
-  "body": "Committed: a1b2c3d feat: implement user auth module\n...",
+  "body": "Committed: a1b2c3d feat: implement user auth ...",
   "metadata": {
     "commit_sha": "a1b2c3d",
     "files_changed": ["src/auth.py", "src/models.py"],
@@ -169,7 +168,7 @@ Each message is a JSON file written atomically (write `.tmp`, then `mv`):
 ```
 agentmsg/
 ├── bin/
-│   └── agentmsg              # CLI tool (bash, ~500 lines)
+│   └── agentmsg              # CLI: messaging + pane control + launch (~700 lines)
 ├── hooks/
 │   ├── post-commit            # Auto-sends review_request on commit
 │   └── pre-push               # Blocks push if unread reviews pending
@@ -177,8 +176,8 @@ agentmsg/
 │   ├── CLAUDE.md              # Project instructions for Claude Code
 │   └── codex-instructions.md  # Project instructions for Codex
 ├── install.sh                 # Install agentmsg to PATH
-├── setup-project.sh           # Bootstrap a project for dual-agent workflow
-├── launch-agents.sh           # Launch tmux session with both agents
+├── setup-project.sh           # Bootstrap a project (without launching)
+├── launch-agents.sh           # Thin wrapper around agentmsg launch
 └── README.md
 ```
 
@@ -190,8 +189,6 @@ agentmsg/
 │   ├── claude/     # messages waiting for Claude
 │   └── codex/      # messages waiting for Codex
 ├── archive/        # read/acknowledged messages
-│   ├── claude/
-│   └── codex/
 ├── lock/           # lockfiles for atomic sends
 └── agentmsg.log    # append-only event log
 ```
@@ -199,6 +196,12 @@ agentmsg/
 ## Debugging
 
 ```bash
+# See all panes
+agentmsg pane-list
+
+# Read what Codex is doing
+agentmsg pane-read codex 50
+
 # See all messages on disk
 find /tmp/agentmsg -name '*.json' -exec jq -r \
     '"[\(.id)] \(.from)->\(.to) \(.type): \(.subject)"' {} \;
@@ -214,8 +217,12 @@ rm -rf /tmp/agentmsg && agentmsg init .
 
 - `bash` (4.0+)
 - `jq`
+- `tmux` (3.2+ recommended)
 - `inotify-tools` (optional, for faster message detection)
-- `tmux` (for the launcher)
+
+## Credits
+
+Pane control concepts inspired by [smux](https://github.com/ShawnPana/smux/).
 
 ## License
 
