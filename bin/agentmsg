@@ -7,7 +7,25 @@ AGENTMSG_IDENTITY="${AGENTMSG_IDENTITY:-}"
 AGENTMSG_POLL_INTERVAL="${AGENTMSG_POLL_INTERVAL:-2}"
 AGENTMSG_STALE_SECONDS="${AGENTMSG_STALE_SECONDS:-3600}"
 
+AGENTMSG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENTMSG_LIB="${AGENTMSG_LIB:-}"
+
 die() { echo "agentmsg: error: $*" >&2; exit 1; }
+
+# Resolve where hooks/ and templates/ live.
+# Priority: AGENTMSG_LIB env > repo-relative (../hooks) > installed (/usr/local/lib/agentmsg)
+resolve_lib_dir() {
+    local subdir="$1"
+    if [ -n "$AGENTMSG_LIB" ] && [ -d "$AGENTMSG_LIB/$subdir" ]; then
+        echo "$AGENTMSG_LIB/$subdir"
+    elif [ -d "$AGENTMSG_SCRIPT_DIR/../$subdir" ]; then
+        echo "$AGENTMSG_SCRIPT_DIR/../$subdir"
+    elif [ -d "/usr/local/lib/agentmsg/$subdir" ]; then
+        echo "/usr/local/lib/agentmsg/$subdir"
+    else
+        echo ""
+    fi
+}
 
 require_identity() {
     [ -n "$AGENTMSG_IDENTITY" ] || die "AGENTMSG_IDENTITY not set. Export it first: export AGENTMSG_IDENTITY=claude"
@@ -62,9 +80,8 @@ install_hook() {
     local hooks_dir="$repo_dir/.git/hooks"
     local hook_marker="# AGENTMSG_HOOK"
 
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local templates_dir="${script_dir}/../hooks"
+    local templates_dir
+    templates_dir="$(resolve_lib_dir hooks)"
 
     for hook_name in post-commit pre-push; do
         local hook_path="${hooks_dir}/${hook_name}"
@@ -76,7 +93,7 @@ install_hook() {
 
         local hook_content=""
 
-        if [ -f "${templates_dir}/${hook_name}" ]; then
+        if [ -n "$templates_dir" ] && [ -f "${templates_dir}/${hook_name}" ]; then
             hook_content=$(cat "${templates_dir}/${hook_name}")
         elif [ "$hook_name" = "post-commit" ]; then
             hook_content=$(cat <<'HOOKEOF'
@@ -559,7 +576,7 @@ cmd_launch() {
 
     local project="${1:-.}"
     local session="agents"
-    local claude_cmd="${AGENTMSG_CLAUDE_CMD:-claude}"
+    local claude_cmd="${AGENTMSG_CLAUDE_CMD:-claude --dangerously-skip-permissions}"
     local codex_cmd="${AGENTMSG_CODEX_CMD:-codex}"
 
     [ -d "$project" ] || die "project directory not found: $project"
@@ -570,12 +587,11 @@ cmd_launch() {
         cmd_init "$project"
     fi
 
-    # Copy templates if project has a .git dir and no CLAUDE.md
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local templates_dir="${script_dir}/../templates"
+    # Copy agent instruction templates into the project
+    local templates_dir
+    templates_dir="$(resolve_lib_dir templates)"
 
-    if [ -d "$project/.git" ] && [ -d "$templates_dir" ]; then
+    if [ -d "$project/.git" ] && [ -n "$templates_dir" ]; then
         if [ ! -f "$project/CLAUDE.md" ] && [ -f "$templates_dir/CLAUDE.md" ]; then
             cp "$templates_dir/CLAUDE.md" "$project/CLAUDE.md"
             echo "agentmsg: created $project/CLAUDE.md"
@@ -584,6 +600,8 @@ cmd_launch() {
             cp "$templates_dir/codex-instructions.md" "$project/codex-instructions.md"
             echo "agentmsg: created $project/codex-instructions.md"
         fi
+    elif [ -z "$templates_dir" ]; then
+        echo "agentmsg: warning: templates directory not found, skipping CLAUDE.md / codex-instructions.md"
     fi
 
     # Kill existing session

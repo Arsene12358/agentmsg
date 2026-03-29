@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${1:-/usr/local/bin}"
+INSTALL_BIN="${1:-/usr/local/bin}"
+INSTALL_LIB="${AGENTMSG_LIB:-/usr/local/lib/agentmsg}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+do_install() {
+    if [ -w "$(dirname "$1")" ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
 
 echo "agentmsg installer"
 echo "==================="
@@ -16,34 +25,33 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 if command -v inotifywait >/dev/null 2>&1; then
-    echo "inotifywait detected — agentmsg will use it for low-latency message detection"
+    echo "inotifywait detected — low-latency message detection enabled"
 else
-    echo "inotifywait not found — agentmsg will use polling (install inotify-tools for faster detection)"
+    echo "inotifywait not found — will use polling (install inotify-tools for faster detection)"
 fi
 echo ""
+
+# Create lib directory for hooks + templates
+do_install mkdir -p "$INSTALL_LIB/hooks"
+do_install mkdir -p "$INSTALL_LIB/templates"
 
 # Install binary
-if [ -w "$INSTALL_DIR" ]; then
-    cp "$SCRIPT_DIR/bin/agentmsg" "$INSTALL_DIR/agentmsg"
-    chmod +x "$INSTALL_DIR/agentmsg"
-else
-    echo "Need sudo to install to $INSTALL_DIR"
-    sudo cp "$SCRIPT_DIR/bin/agentmsg" "$INSTALL_DIR/agentmsg"
-    sudo chmod +x "$INSTALL_DIR/agentmsg"
+do_install cp "$SCRIPT_DIR/bin/agentmsg" "$INSTALL_BIN/agentmsg"
+do_install chmod +x "$INSTALL_BIN/agentmsg"
+echo "Installed binary to $INSTALL_BIN/agentmsg"
+
+# Install hooks
+if [ -d "$SCRIPT_DIR/hooks" ]; then
+    do_install cp "$SCRIPT_DIR/hooks"/* "$INSTALL_LIB/hooks/"
+    echo "Installed hooks to $INSTALL_LIB/hooks/"
 fi
 
-echo "Installed agentmsg to $INSTALL_DIR/agentmsg"
-
-# Copy hook templates next to the binary so install_hook() can find them
-HOOKS_DEST="$(dirname "$INSTALL_DIR/agentmsg")/../hooks"
-if [ -d "$SCRIPT_DIR/hooks" ]; then
-    mkdir -p "$HOOKS_DEST" 2>/dev/null || sudo mkdir -p "$HOOKS_DEST"
-    cp "$SCRIPT_DIR/hooks"/* "$HOOKS_DEST/" 2>/dev/null || sudo cp "$SCRIPT_DIR/hooks"/* "$HOOKS_DEST/"
-    echo "Installed hook templates to $HOOKS_DEST/"
+# Install templates
+if [ -d "$SCRIPT_DIR/templates" ]; then
+    do_install cp "$SCRIPT_DIR/templates"/* "$INSTALL_LIB/templates/"
+    echo "Installed templates to $INSTALL_LIB/templates/"
 fi
 
 echo ""
-echo "Done! Next steps:"
-echo "  1. export AGENTMSG_IDENTITY=claude   # or codex"
-echo "  2. agentmsg init /path/to/your/repo"
-echo "  3. See README.md for usage patterns"
+echo "Done! Quick start:"
+echo "  agentmsg launch ~/my-project"
