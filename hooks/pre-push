@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# AGENTMSG_HOOK — pre-push hook
+# Blocks push until all pending review_response messages have been received.
+# This ensures code is reviewed before it leaves the local machine.
+#
+# Set AGENTMSG_SKIP_REVIEW_GATE=1 to bypass.
+
+set -uo pipefail
+
+IDENTITY="${AGENTMSG_IDENTITY:-}"
+[ -z "$IDENTITY" ] && exit 0
+command -v agentmsg >/dev/null 2>&1 || exit 0
+
+[ "${AGENTMSG_SKIP_REVIEW_GATE:-0}" = "1" ] && exit 0
+
+INBOX_DIR="${AGENTMSG_DIR:-/tmp/agentmsg}/inbox/${IDENTITY}"
+PENDING=0
+
+for f in "$INBOX_DIR"/*.json 2>/dev/null; do
+    [ -f "$f" ] || continue
+    TYPE=$(jq -r '.type' "$f" 2>/dev/null)
+    if [ "$TYPE" = "review_request" ] || [ "$TYPE" = "fix_request" ]; then
+        PENDING=$((PENDING + 1))
+    fi
+done
+
+if [ "$PENDING" -gt 0 ]; then
+    echo "agentmsg: blocking push — $PENDING unread review/fix request(s) pending"
+    echo "agentmsg: read them with 'agentmsg list' and 'agentmsg read <id>'"
+    echo "agentmsg: or bypass with AGENTMSG_SKIP_REVIEW_GATE=1 git push"
+    exit 1
+fi
+
+exit 0

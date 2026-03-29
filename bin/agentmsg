@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AGENTMSG_VERSION="1.0.0"
+AGENTMSG_DIR="${AGENTMSG_DIR:-/tmp/agentmsg}"
+AGENTMSG_IDENTITY="${AGENTMSG_IDENTITY:-}"
+AGENTMSG_POLL_INTERVAL="${AGENTMSG_POLL_INTERVAL:-2}"
+AGENTMSG_STALE_SECONDS="${AGENTMSG_STALE_SECONDS:-3600}"
+
+die() { echo "agentmsg: error: $*" >&2; exit 1; }
+
+require_identity() {
+    [ -n "$AGENTMSG_IDENTITY" ] || die "AGENTMSG_IDENTITY not set. Export it first: export AGENTMSG_IDENTITY=claude"
+}
+
+require_jq() {
+    command -v jq >/dev/null 2>&1 || die "jq is required but not installed"
+}
+
+inbox_dir()   { echo "$AGENTMSG_DIR/inbox/$1"; }
+archive_dir() { echo "$AGENTMSG_DIR/archive/$1"; }
+lock_dir()    { echo "$AGENTMSG_DIR/lock"; }
+log_file()    { echo "$AGENTMSG_DIR/agentmsg.log"; }
+
+next_seq() {
+    local dir="$1"
+    local last
+    last=$(ls -1 "$dir" 2>/dev/null | grep -oP '^\d+' | sort -n | tail -1)
+    printf "%03d" $(( ${last:-0} + 1 ))
+}
+
+log_entry() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$(log_file)"
+}
+
+# ─── init ──────────────────────────────────────────────────────────────────────
+
+cmd_init() {
+    local repo_dir="${1:-.}"
+    local agents=("claude" "codex")
+
+    mkdir -p "$AGENTMSG_DIR"/{lock}
+    for agent in "${agents[@]}"; do
+        mkdir -p "$(inbox_dir "$agent")" "$(archive_dir "$agent")"
+    done
+    touch "$(log_file)"
+
+    log_entry "INIT directory structure created at $AGENTMSG_DIR"
+    echo "agentmsg: initialized at $AGENTMSG_DIR"
+
+    if [ -d "$repo_dir/.git" ]; then
+        install_hook "$repo_dir"
+    elif [ "$repo_dir" != "." ]; then
+        echo "agentmsg: warning: $repo_dir is not a git repository, skipping hook install"
+    else
+        echo "agentmsg: hint: run 'agentmsg init /path/to/repo' inside a git repo to install hooks"
+    fi
+}
+
+install_hook() {
+    local repo_dir="$1"
+    local hooks_dir="$repo_dir/.git/hooks"
+    local hook_marker="# AGENTMSG_HOOK"
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local templates_dir="${script_dir}/../hooks"
+
+    for hook_name in post-commit pre-push; do
+        local hook_path="${hooks_dir}/${hook_name}"
+
+        if [ -f "$hook_path" ] && grep -q "$hook_marker" "$hook_path"; then
+            echo "agentmsg: ${hook_name} hook already installed"
+            continue
+        fi
+
+        local hook_content=""
+
+        if [ -f "${templates_dir}/${hook_name}" ]; then
+            hook_content=$(cat "${templates_dir}/${hook_name}")
+        elif [ "$hook_name" = "post-commit" ]; then
+            hook_content=$(cat <<'HOOKEOF'
+#!/usr/bin/env bash
+# AGENTMSG_HOOK — auto-generated post-commit
+set -uo pipefail
+IDENTITY="${AGENTMSG_IDENTITY:-}"
+[ -z "$IDENTITY" ] && exit 0
+command -v agentmsg >/dev/null 2>&1 || exit 0
+
+SHA=$(git rev-parse --short HEAD)
+MSG=$(git log --oneline -1)
+STAT=$(git diff --stat HEAD~1 HEAD 2>/dev/null || echo "initial commit")
+FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo "[]")
+
+case "$IDENTITY" in
+    claude) TO="codex" ;;
+    codex)  TO="claude" ;;
+    *)      exit 0 ;;
+esac
+
+agentmsg send "$TO" "Committed: $MSG" \
+    --type review_request \
+    --subject "$MSG" \
+    --meta-sha "$SHA" \
+    --meta-files "$FILES" \
+    --meta-stat "$STAT" 2>/dev/null || true
+HOOKEOF
+)
+        elif [ "$hook_name" = "pre-push" ]; then
+            hook_content=$(cat <<'HOOKEOF'
+#!/usr/bin/env bash
+# AGENTMSG_HOOK — auto-generated pre-push
+set -uo pipefail
+IDENTITY="${AGENTMSG_IDENTITY:-}"
+[ -z "$IDENTITY" ] && exit 0
+command -v agentmsg >/dev/null 2>&1 || exit 0
+[ "${AGENTMSG_SKIP_REVIEW_GATE:-0}" = "1" ] && exit 0
+
+INBOX_DIR="${AGENTMSG_DIR:-/tmp/agentmsg}/inbox/${IDENTITY}"
+PENDING=0
+for f in "$INBOX_DIR"/*.json 2>/dev/null; do
+    [ -f "$f" ] || continue
+    TYPE=$(jq -r '.type' "$f" 2>/dev/null)
+    [ "$TYPE" = "review_request" ] || [ "$TYPE" = "fix_request" ] && PENDING=$((PENDING + 1))
+done
+if [ "$PENDING" -gt 0 ]; then
+    echo "agentmsg: blocking push — $PENDING unread review/fix request(s)"
+    echo "agentmsg: bypass with AGENTMSG_SKIP_REVIEW_GATE=1 git push"
+    exit 1
+fi
+exit 0
+HOOKEOF
+)
+        fi
+
+        [ -z "$hook_content" ] && continue
+
+        if [ -f "$hook_path" ]; then
+            echo "" >> "$hook_path"
+            echo "$hook_content" >> "$hook_path"
+        else
+            echo "$hook_content" > "$hook_path"
+        fi
+        chmod +x "$hook_path"
+        log_entry "HOOK installed ${hook_name} hook at $hook_path"
+        echo "agentmsg: installed ${hook_name} hook at $hook_path"
+    done
+}
+
+# ─── send ──────────────────────────────────────────────────────────────────────
+
+cmd_send() {
+    require_identity
+    require_jq
+
+    local to="" body="" msg_type="info" subject="" reply_to="null"
+    local meta_sha="null" meta_files="null" meta_stat="null"
+
+    if [ $# -lt 2 ]; then
+        die "usage: agentmsg send <to> <body> [--type T] [--subject S] [--reply-to ID] [--meta-*]"
+    fi
+    to="$1"; shift
+    body="$1"; shift
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --type)       msg_type="$2"; shift 2 ;;
+            --subject)    subject="$2"; shift 2 ;;
+            --reply-to)   reply_to="\"$2\""; shift 2 ;;
+            --meta-sha)   meta_sha="\"$2\""; shift 2 ;;
+            --meta-files) meta_files="$2"; shift 2 ;;
+            --meta-stat)  meta_stat="\"$2\""; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    [ -z "$subject" ] && subject="$body"
+
+    local dest
+    dest="$(inbox_dir "$to")"
+    [ -d "$dest" ] || die "unknown recipient: $to (run 'agentmsg init' first)"
+
+    local lockfile
+    lockfile="$(lock_dir)/${to}.lock"
+
+    (
+        flock -w 5 200 || die "could not acquire lock for $to"
+
+        local seq ts msg_id tmpfile finalfile
+        seq=$(next_seq "$dest")
+        ts=$(date -u +%s)
+        msg_id="${seq}-${ts}-${AGENTMSG_IDENTITY}"
+
+        tmpfile="${dest}/${msg_id}.json.tmp"
+        finalfile="${dest}/${msg_id}.json"
+
+        jq -n \
+            --arg id "$msg_id" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg from "$AGENTMSG_IDENTITY" \
+            --arg to "$to" \
+            --arg type "$msg_type" \
+            --arg subject "$subject" \
+            --arg body "$body" \
+            --argjson reply_to "$reply_to" \
+            --argjson meta_sha "$meta_sha" \
+            --argjson meta_files "$meta_files" \
+            --argjson meta_stat "$meta_stat" \
+            '{
+                id: $id,
+                timestamp: $ts,
+                from: $from,
+                to: $to,
+                type: $type,
+                subject: $subject,
+                body: $body,
+                metadata: {
+                    commit_sha: $meta_sha,
+                    files_changed: $meta_files,
+                    diff_stat: $meta_stat
+                },
+                reply_to: $reply_to,
+                status: "pending"
+            }' > "$tmpfile"
+
+        mv "$tmpfile" "$finalfile"
+        log_entry "SEND $AGENTMSG_IDENTITY -> $to [$msg_type] $msg_id"
+        echo "$msg_id"
+
+    ) 200>"$lockfile"
+}
+
+# ─── wait ──────────────────────────────────────────────────────────────────────
+
+cmd_wait() {
+    require_identity
+    require_jq
+
+    local timeout=300 msg_type=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout) timeout="$2"; shift 2 ;;
+            --type)    msg_type="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    local my_inbox
+    my_inbox="$(inbox_dir "$AGENTMSG_IDENTITY")"
+    local my_archive
+    my_archive="$(archive_dir "$AGENTMSG_IDENTITY")"
+    local elapsed=0
+
+    local now
+    now=$(date -u +%s)
+    for f in "$my_inbox"/*.json 2>/dev/null; do
+        [ -f "$f" ] || continue
+        local msg_ts
+        msg_ts=$(jq -r '.timestamp' "$f" 2>/dev/null) || continue
+        local msg_epoch
+        msg_epoch=$(date -d "$msg_ts" +%s 2>/dev/null) || continue
+        if (( now - msg_epoch > AGENTMSG_STALE_SECONDS )); then
+            mv "$f" "$my_archive/"
+            log_entry "STALE archived $(basename "$f")"
+        fi
+    done
+
+    log_entry "WAIT $AGENTMSG_IDENTITY waiting (timeout=${timeout}s, type=${msg_type:-any})"
+
+    local use_inotify=false
+    if command -v inotifywait >/dev/null 2>&1; then
+        use_inotify=true
+    fi
+
+    while (( elapsed < timeout )); do
+        local candidates=()
+        for f in "$my_inbox"/*.json; do
+            [ -f "$f" ] || continue
+            if [ -n "$msg_type" ]; then
+                local ft
+                ft=$(jq -r '.type' "$f" 2>/dev/null)
+                [ "$ft" = "$msg_type" ] || continue
+            fi
+            candidates+=("$f")
+        done
+
+        if [ ${#candidates[@]} -gt 0 ]; then
+            local oldest
+            oldest=$(printf '%s\n' "${candidates[@]}" | sort | head -1)
+
+            local content
+            content=$(cat "$oldest")
+            mv "$oldest" "$my_archive/"
+
+            local msg_id
+            msg_id=$(echo "$content" | jq -r '.id')
+            log_entry "RECV $AGENTMSG_IDENTITY <- $(echo "$content" | jq -r '.from') [$msg_id]"
+
+            echo "$content"
+            return 0
+        fi
+
+        if $use_inotify; then
+            inotifywait -t "$AGENTMSG_POLL_INTERVAL" -qq -e create -e moved_to "$my_inbox" 2>/dev/null || true
+        else
+            sleep "$AGENTMSG_POLL_INTERVAL"
+        fi
+        elapsed=$(( elapsed + AGENTMSG_POLL_INTERVAL ))
+    done
+
+    log_entry "TIMEOUT $AGENTMSG_IDENTITY wait timed out after ${timeout}s"
+    echo '{"error": "timeout", "waited_seconds": '"$timeout"'}' >&2
+    return 1
+}
+
+# ─── list ──────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    require_identity
+    require_jq
+
+    local my_inbox
+    my_inbox="$(inbox_dir "$AGENTMSG_IDENTITY")"
+    local count=0
+
+    for f in "$my_inbox"/*.json; do
+        [ -f "$f" ] || continue
+        count=$((count + 1))
+        jq -r '"[\(.id)] \(.type) from=\(.from) subj=\"\(.subject)\" @ \(.timestamp)"' "$f"
+    done
+
+    if [ "$count" -eq 0 ]; then
+        echo "agentmsg: no pending messages for $AGENTMSG_IDENTITY"
+    fi
+}
+
+# ─── read ──────────────────────────────────────────────────────────────────────
+
+cmd_read() {
+    require_identity
+    require_jq
+
+    local target_id="${1:-}"
+    [ -z "$target_id" ] && die "usage: agentmsg read <message-id>"
+
+    local my_inbox
+    my_inbox="$(inbox_dir "$AGENTMSG_IDENTITY")"
+    local my_archive
+    my_archive="$(archive_dir "$AGENTMSG_IDENTITY")"
+
+    for f in "$my_inbox"/*.json; do
+        [ -f "$f" ] || continue
+        local fid
+        fid=$(jq -r '.id' "$f" 2>/dev/null)
+        if [ "$fid" = "$target_id" ]; then
+            cat "$f"
+            mv "$f" "$my_archive/"
+            log_entry "READ $AGENTMSG_IDENTITY acknowledged $target_id"
+            return 0
+        fi
+    done
+
+    for f in "$my_archive"/*.json; do
+        [ -f "$f" ] || continue
+        local fid
+        fid=$(jq -r '.id' "$f" 2>/dev/null)
+        if [ "$fid" = "$target_id" ]; then
+            echo "(archived)"
+            cat "$f"
+            return 0
+        fi
+    done
+
+    die "message not found: $target_id"
+}
+
+# ─── history ───────────────────────────────────────────────────────────────────
+
+cmd_history() {
+    require_identity
+
+    local limit="${1:-20}"
+    local logf
+    logf="$(log_file)"
+
+    if [ ! -f "$logf" ]; then
+        echo "agentmsg: no history yet"
+        return 0
+    fi
+
+    echo "=== Last $limit log entries ==="
+    tail -n "$limit" "$logf"
+
+    echo ""
+    echo "=== Archived conversations ==="
+    local my_archive
+    my_archive="$(archive_dir "$AGENTMSG_IDENTITY")"
+
+    if command -v jq >/dev/null 2>&1; then
+        for f in $(ls -1t "$my_archive"/*.json 2>/dev/null | head -"$limit"); do
+            jq -r '"  \(.timestamp) [\(.type)] \(.from)->\(.to): \(.subject)"' "$f" 2>/dev/null
+        done
+    fi
+}
+
+# ─── status ────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    require_jq
+
+    echo "agentmsg v${AGENTMSG_VERSION}"
+    echo "directory: $AGENTMSG_DIR"
+    echo "identity:  ${AGENTMSG_IDENTITY:-(not set)}"
+    echo ""
+
+    if [ ! -d "$AGENTMSG_DIR/inbox" ]; then
+        echo "not initialized — run 'agentmsg init'"
+        return 0
+    fi
+
+    echo "Pending messages:"
+    for agent_dir in "$AGENTMSG_DIR/inbox"/*/; do
+        [ -d "$agent_dir" ] || continue
+        local agent
+        agent=$(basename "$agent_dir")
+        local count
+        count=$(find "$agent_dir" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+        echo "  $agent: $count"
+    done
+
+    echo ""
+    echo "Archived messages:"
+    for agent_dir in "$AGENTMSG_DIR/archive"/*/; do
+        [ -d "$agent_dir" ] || continue
+        local agent
+        agent=$(basename "$agent_dir")
+        local count
+        count=$(find "$agent_dir" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+        echo "  $agent: $count"
+    done
+}
+
+# ─── install ───────────────────────────────────────────────────────────────────
+
+cmd_install_hook() {
+    local repo_dir="${1:-.}"
+    [ -d "$repo_dir/.git" ] || die "$repo_dir is not a git repository"
+    install_hook "$repo_dir"
+}
+
+# ─── help ──────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'HELP'
+agentmsg — inter-agent messaging system
+
+USAGE:
+    agentmsg <command> [args...]
+
+COMMANDS:
+    init [repo-path]              Initialize messaging directory + install git hooks
+    send <to> <body> [options]    Send a message to another agent
+    wait [--timeout N] [--type T] Block until a message arrives (prints JSON to stdout)
+    list                          List pending messages in your inbox
+    read <message-id>             Read and acknowledge a specific message
+    history [N]                   Show last N log entries and archived messages
+    status                        Show system status and message counts
+    install-hook <repo-path>      Install git post-commit hook into a repo
+    help                          Show this help
+
+SEND OPTIONS:
+    --type <type>           Message type: review_request, review_response,
+                            fix_request, fix_complete, info, ack
+    --subject <text>        Subject line (defaults to body)
+    --reply-to <id>         ID of message being replied to
+    --meta-sha <sha>        Commit SHA (for review_request)
+    --meta-files <json>     Changed files as JSON array
+    --meta-stat <text>      Diff stat text
+
+ENVIRONMENT:
+    AGENTMSG_IDENTITY       Required. Your agent name (e.g., "claude" or "codex")
+    AGENTMSG_DIR            Message directory (default: /tmp/agentmsg)
+    AGENTMSG_POLL_INTERVAL  Seconds between polls in wait (default: 2)
+    AGENTMSG_STALE_SECONDS  Archive messages older than this (default: 3600)
+
+EXAMPLES:
+    export AGENTMSG_IDENTITY=claude
+    agentmsg init ~/my-project
+    agentmsg send codex "Auth module done, please review" --type review_request
+    agentmsg wait --timeout 600
+
+    export AGENTMSG_IDENTITY=codex
+    agentmsg wait --timeout 600 --type review_request
+    agentmsg send claude "LGTM, ship it" --type review_response
+HELP
+}
+
+# ─── main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        init)          cmd_init "$@" ;;
+        send)          cmd_send "$@" ;;
+        wait)          cmd_wait "$@" ;;
+        list)          cmd_list "$@" ;;
+        read)          cmd_read "$@" ;;
+        history)       cmd_history "$@" ;;
+        status)        cmd_status "$@" ;;
+        install-hook)  cmd_install_hook "$@" ;;
+        help|--help|-h) cmd_help ;;
+        version|--version|-v) echo "agentmsg v${AGENTMSG_VERSION}" ;;
+        *)             die "unknown command: $cmd (try 'agentmsg help')" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# AGENTMSG_HOOK — post-commit hook
+# Installed by: agentmsg init <repo>
+# Automatically sends a review_request to the peer agent after each commit.
+#
+# Requirements:
+#   - AGENTMSG_IDENTITY env var set to "claude" or "codex"
+#   - agentmsg CLI on PATH
+#   - jq installed
+
+set -uo pipefail
+
+IDENTITY="${AGENTMSG_IDENTITY:-}"
+[ -z "$IDENTITY" ] && exit 0
+command -v agentmsg >/dev/null 2>&1 || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+# Determine peer agent
+case "$IDENTITY" in
+    claude) TO="codex" ;;
+    codex)  TO="claude" ;;
+    *)      exit 0 ;;
+esac
+
+SHA=$(git rev-parse --short HEAD)
+SUBJECT=$(git log --oneline -1)
+STAT=$(git diff --stat HEAD~1 HEAD 2>/dev/null || echo "initial commit")
+
+# Build JSON array of changed files
+FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | jq -R . | jq -s . 2>/dev/null || echo '[]')
+
+# Count lines changed for the subject line
+INSERTIONS=$(git diff --shortstat HEAD~1 HEAD 2>/dev/null | grep -oP '\d+(?= insertion)' || echo "0")
+DELETIONS=$(git diff --shortstat HEAD~1 HEAD 2>/dev/null | grep -oP '\d+(?= deletion)' || echo "0")
+
+BODY="Committed: ${SUBJECT}
+Files changed:
+${STAT}
+
+Please review this commit for:
+1. Bugs and logic errors
+2. Security vulnerabilities
+3. Missing error handling
+4. Style and readability
+
+Lines: +${INSERTIONS} -${DELETIONS}"
+
+agentmsg send "$TO" "$BODY" \
+    --type review_request \
+    --subject "$SUBJECT" \
+    --meta-sha "$SHA" \
+    --meta-files "$FILES" \
+    --meta-stat "$STAT" 2>/dev/null || true
